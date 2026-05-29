@@ -64,21 +64,26 @@ involvement. The only prerequisite is a service account with domain-wide
 delegation and the `cloud-identity.devices` scope.
 
 If Fleet later joins the BeyondCorp Alliance (fleetdm/fleet#28476), the
-integration trivially flips to using Google's assigned partner ID. Three
-things improve, the third of which is end-user-visible:
+integration trivially flips to using Google's assigned partner ID and
+three things improve:
 
 - Fleet shows up in the third-party integrations list in admin.google.com,
-  making customer setup one-click.
-- Custom access-level setup is one-click rather than requiring the admin
-  to type the `{C-id}-fleet` partner segment.
-- **CAA Remediator messages render with "Fleet" as the partner name**
-  rather than a raw `{C-id}-fleet` token. This is the only end-user-visible
-  improvement available on the Google side, and it is the strongest
-  practical reason to pursue partner status — see *Rich end-user
-  remediation lives in Fleet Desktop, not Google's deny page* below.
+  making customer connection one-click.
+- The CAA Custom Access Level expression key shortens from
+  `device.vendors["fleet-{C-id-without-C}"]` (the non-Alliance
+  customer-ID-concatenated form per the Access Context Manager spec) to
+  a short global identifier like `device.vendors["Fleet"]`. Customer
+  CAA expressions become portable across tenants and less error-prone
+  to author.
+- Because the CAA Remediator `[PARTNER NAME]` token substitutes the
+  identifier used in the CAA expression, the end-user-visible string on
+  the deny page changes from `fleet-{C-id-without-C}` to whatever
+  identifier the Alliance registers Fleet under. This is end-user-visible
+  but cosmetic.
 
-The data model, the fields Fleet writes, and the customer-side
-configuration do not change between non-partner and partner modes.
+The Fleet-side data model and the ClientState fields Fleet writes do not
+change between non-partner and partner modes; what changes is the
+customer-side authoring experience for CAA policies.
 
 ## Customer-side prerequisites and edition eligibility
 
@@ -138,7 +143,57 @@ security management" rather than a generic auth error.
 - No GCP project of Fleet's needs to exist on the customer side; the
   service account lives in the customer's project.
 
-## What the integration does
+### CAA expression syntax for the customer's policies
+
+Per the Access Context Manager Custom Access Level spec (`device.vendors`
+section), the key form in CAA Custom Access Level expressions for a
+non-Alliance integration is:
+
+```text
+{suffix}-{customer_id_without_C}
+```
+
+where `customer_id_without_C` is the customer's Cloud Identity ID with
+the leading `C` stripped. Note the order is **reversed** relative to the
+REST resource-name partner segment, which is written as
+`{customer_id_without_C}-{suffix}` in the ClientState's `name` field.
+Both forms refer to the same underlying record; the spec is just
+explicit that the CEL accessor uses the suffix-first ordering.
+
+With Fleet's default `partner_suffix: fleet`, a customer with Cloud
+Identity ID `C0xxxxxxx` would write expressions like:
+
+```cel
+// Block access if Fleet does not consider the device compliant
+device.vendors["fleet-0xxxxxxx"].is_compliant_device == true
+
+// Or require a minimum health score
+device.vendors["fleet-0xxxxxxx"].device_health_score >= DeviceHealthScore.GOOD
+
+// Reference a Fleet-specific key written via ClientState.keyValuePairs
+device.vendors["fleet-0xxxxxxx"].data["fleet_team"] == "engineering"
+```
+
+The three well-known top-level attributes Fleet populates for every
+deviceUser are:
+
+- `is_compliant_device` (boolean) — from ClientState `complianceState`.
+- `is_managed_device` (boolean) — from ClientState `managed`.
+- `device_health_score` (enum `DeviceHealthScore`) — from ClientState
+  `healthScore`. Values: `VERY_POOR`, `POOR`, `NEUTRAL`, `GOOD`,
+  `VERY_GOOD`.
+
+Anything Fleet writes via `keyValuePairs` surfaces as
+`device.vendors["fleet-{C-id}"].data["{key}"]`. Per Google's spec,
+integer values must be compared with double literals (`== 1.0`, not
+`== 1`); strings and booleans compare naturally.
+
+This same CEL accessor is what Alliance-listed partners use — Lookout's
+expression is `device.vendors["Lookout"].is_compliant_device`, with no
+customer-ID concatenation because the listed-partner key is registered
+globally. The shape is identical aside from the key; Fleet's docs ship
+copy-paste-able expression templates with the customer's ID
+auto-substituted on the integration page.
 
 For each host that is enrolled in Fleet and has at least one Google Workspace
 user signed in on a Cloud-Identity-registered device (i.e., the host has gone
@@ -204,16 +259,17 @@ ClientState for one selected host.
 ### End-user UX
 
 None directly — but the practical effect is that Workspace admins can write
-CAA policies like:
+CAA Custom Access Levels like:
 
 ```cel
-device.policy_compliant == true AND
-device.vendor.partner_id == "0xxxxxxx-fleet" AND
-device.vendor.asset_tag.contains("team:engineering")
+device.vendors["fleet-0xxxxxxx"].is_compliant_device == true &&
+device.vendors["fleet-0xxxxxxx"].device_health_score == DeviceHealthScore.GOOD
 ```
 
 …to gate Drive, Gmail, or any SAML-federated app on Fleet's view of device
-health.
+health. The exact `device.vendors[…]` key form is documented in
+*Customer-side prerequisites and edition eligibility → CAA expression
+syntax* below.
 
 ## Architecture sketch
 
@@ -358,11 +414,12 @@ not (see next section).
    `COMPLIANT` records keep granting access via CAA forever — a gap the
    Entra doc leaves silent and worth closing on both providers.
 6. **End-user remediation path through Fleet Desktop.** See *Rich
-   end-user remediation lives in Fleet Desktop* below. Short version: the
-   Google deny page is not a customizable surface, so all rich
-   remediation (failing-policy list, fix instructions, Refetch button)
-   must live in Fleet Desktop and be driven by Fleet's own client, the
-   same way the Entra "Check Compliance" flow is.
+   end-user remediation: what Google exposes, what Fleet owns* below.
+   Short version: the Google deny page has limited customizability
+   (admin-set strings only, no partner-write per-policy detail), so all
+   rich remediation (failing-policy list, fix instructions, Refetch
+   button) must live in Fleet Desktop and be driven by Fleet's own
+   client, the same way the Entra "Check Compliance" flow is.
 7. **Stale/offline hosts age out to non-compliant.** A configurable
    threshold (default 7 days without check-in) flips
    `complianceState: NON_COMPLIANT, scoreReason: "Host offline > N days"`.
@@ -413,19 +470,19 @@ should not be replicated in the Google path:
 
 The end-user-facing denial experience is shaped by **four** surfaces.
 Three of them are read-only, admin-set, or fixed-by-Google; only one is
-fully Fleet-controlled. Naming them all out so we don't repeat the
-incorrect "Google has no levers here" framing, but also don't repeat the
-incorrect "there's an API for this" framing.
+fully Fleet-controlled.
 
 **1. CAA Remediator strings** (the "Allow users to unblock apps with
 remediation messages" feature). When a `device.vendors[…]` check fails,
 Google renders one of a small fixed set of strings, e.g. *"Your device
 isn't meeting some requirements, based on information from [PARTNER
-NAME]"*. `[PARTNER NAME]` is a token Google substitutes from the
-BeyondCorp Alliance partner registry; without partner registration, the
-substitution falls back to the raw `{C-id}-fleet` partner segment, which
-is ugly. The partner cannot supply a URL, logo, or per-policy detail
-through this surface.
+NAME]"*. `[PARTNER NAME]` substitutes from the partner identifier used
+in the CAA expression — for a non-Alliance integration, that's the
+`fleet-{C-id-without-C}` key (see the *CAA expression syntax*
+subsection in prerequisites). For an Alliance-listed partner it's the
+registered display name (e.g. "Lookout"). The substituted string is
+shown verbatim; the partner cannot supply a URL, logo, or per-policy
+detail through this surface in either mode.
 
 **2. `description` on a Custom Access Level**
 (`accesscontextmanager.googleapis.com`). Up to 2000 characters, rendered
@@ -501,22 +558,28 @@ other three surfaces accept per-policy or per-user content from Fleet:
   customer can route blocked users to their own intranet help page if
   they prefer. Defaults to Fleet's hosted remediation help.
 
-**ClientState fields are never user-facing.** Worth saying explicitly
-because it's a common (and wrong) assumption: the following fields Fleet
-writes are admin-console-only and CEL-evaluable only — they never
-render on the blocked user's screen: `scoreReason`, `assetTags`,
-`healthScore`, `customId`, `keyValuePairs`. Writing a useful
-`scoreReason` is still worth doing (Workspace admins triaging tickets
-see it in the admin console; CAA expressions can branch on it), but
-admins should not expect it to reach end users via Google's surfaces.
+**ClientState fields are CEL-evaluable but not user-facing.** Worth
+saying explicitly: every field Fleet writes (`complianceState`,
+`managed`, `healthScore`, `scoreReason`, `assetTags`, `customId`,
+`keyValuePairs`) surfaces in CAA expressions as
+`device.vendors["fleet-{C-id}"].is_compliant_device`,
+`.is_managed_device`, `.device_health_score`, and via the `.data[…]`
+extension map. None of those render on the blocked user's screen.
+Writing a useful `scoreReason` is still worth doing — Workspace admins
+triaging tickets see it in the admin console, and CAA expressions can
+branch on it via `.data["score_reason"]` (per the spec's extension-map
+convention) — but admins should not expect it to reach end users via
+Google's surfaces.
 
-**Partner status has real end-user value even pre-Alliance-features.**
-Becoming a registered BeyondCorp Alliance partner (#28476) changes the
-substituted `[PARTNER NAME]` token in CAA Remediator from a raw
-`{C-id}-fleet` string to "Fleet" on every blocked user's screen across
-every Workspace customer using the integration. That's the strongest
-end-user-visible argument for pursuing partner status in parallel with
-shipping this work.
+**Partner status (#28476) is admin-UX, not end-user-UX.** Joining the
+BeyondCorp Alliance gets Fleet listed in admin.google.com's third-party
+integrations picker and replaces the `fleet-{C-id}` CAA expression key
+with a short global name like `device.vendors["Fleet"]`. The
+end-user-visible CAA Remediator substitution changes accordingly (the
+admin's chosen partner identifier is what's interpolated, whatever it
+is). The substantive cases for pursuing Alliance status are admin
+ergonomics (no per-customer customer-ID concatenation in CAA
+expressions) and Google's vetting/listing, not the deny page.
 
 ## Edge cases Fleet decides explicitly here
 
