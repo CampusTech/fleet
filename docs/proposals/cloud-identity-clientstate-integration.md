@@ -297,9 +297,14 @@ A new package `ee/server/integrations/google_cloud_identity/`:
 5. **Backoff** — `429` and `5xx` from Google use exponential backoff with
    jitter; persistent failure bubbles up to the activity feed and metrics.
 
-The first iteration is push-only. A future enhancement could subscribe to
-Cloud Identity's Pub/Sub `device-events` topic to react to device-side state
-changes (e.g., user wiped device → Fleet retires the host).
+The first iteration is push-only. Cloud Identity has no documented push-
+event channel for device-state changes (the Workspace Events API delivers
+Chat/Meet/Drive events to Pub/Sub but does not cover Cloud Identity
+devices). A future enhancement could detect device-side changes by
+periodically calling `devices.get` / `devices.deviceUsers.lookup` and
+diffing against the local cache — e.g., user wiped device → Fleet
+retires the host. Polling cadence would be a tunable separate from the
+existing PATCH `sync_interval`.
 
 ## Endpoint Verification as the resolution mechanism
 
