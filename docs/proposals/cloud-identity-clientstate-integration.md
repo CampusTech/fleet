@@ -24,10 +24,17 @@ device registry that accepts compliance signals from a registered partner and
 exposes those signals to a vendor-side policy engine (Entra CA / Google CAA).
 The Okta SCEP-cert path is unrelated and is not the model here.
 
-This is the interim path explicitly called out in fleetdm/fleet#28476, and it
-is a strict superset of what fleetdm/fleet#43583 asks for (CBCM/Chrome
-Enterprise Premium attestation): once Fleet is writing into Cloud Identity,
-CEP consumes the same signal alongside browser policies.
+This is the interim path explicitly called out in fleetdm/fleet#28476.
+It also covers most of what fleetdm/fleet#43583 asks for: once Fleet is
+writing into Cloud Identity, Context-Aware Access can gate Workspace
+sign-in, Google-fronted SaaS, and any IdP-federated app on Fleet's
+compliance signal regardless of which browser the user is in or whether
+Endpoint Verification is installed. The narrower **CBCM browser
+attestation** half of #43583 — "this managed Chrome browser is running
+on a managed device" as a signal CEP can evaluate — additionally
+requires EV deployed to the device, because that's where the browser
+↔ device binding gets minted. The CAA half is the bulk of the customer
+value; the CEP browser-attestation half is the smaller subset.
 
 ## Related issues
 
@@ -35,8 +42,10 @@ CEP consumes the same signal alongside browser policies.
   proposal is the "interim" path that issue describes, and it does not block
   on partner status)
 - fleetdm/fleet#43583 — Integrate with Chrome Browser Cloud Management to
-  provide MDM device attestation (this proposal subsumes it: ClientState
-  signals are what CEP evaluates)
+  provide MDM device attestation (this proposal covers the CAA half of
+  the customer's ask directly; the CBCM browser-attestation half
+  additionally requires Endpoint Verification on the device, since
+  that's where the browser↔device binding originates)
 - fleetdm/fleet#6566 — Device Trust Scoring (broader trust-scoring framework
   this would plug into)
 - fleetdm/fleet#42915 — IdP host vitals from Google Workspace (inverse
@@ -122,16 +131,33 @@ security management" rather than a generic auth error.
 
 **Required customer-side setup**, beyond having an eligible edition:
 
-- Endpoint Verification deployed to every device that should be evaluated
-  (Chrome extension + native helper on macOS/Windows/Linux). Without EV,
-  there is no `deviceUser` to PATCH — see *Endpoint Verification as the
-  resolution mechanism* below.
+- A Cloud Identity `deviceUser` must exist for each (user, device) pair
+  Fleet should evaluate. A deviceUser is created the first time a
+  Workspace identity is signed into a Google-managed surface on the
+  device — the canonical surfaces are **Endpoint Verification** (Chrome
+  extension + native helper on macOS/Windows/Linux), **Google Mobile
+  Management** (iOS/Android), and **Google Drive for Desktop**. If none
+  of those have ever been used on the device, there is no deviceUser
+  and Fleet has nothing to PATCH.
 - A super-admin to create the GCP service account, enable domain-wide
   delegation, and authorize the `https://www.googleapis.com/auth/cloud-identity.devices`
   scope in the Workspace admin console.
 - The customer's CAA policy authored in admin.google.com referencing the
   Fleet partner segment (`{C-id}-fleet` for the non-partner path, or the
   Alliance-assigned partner ID once Fleet ships #28476).
+
+**Recommended customer-side setup** (not strictly required, but unlocks
+the canonical resolution path and the CEP attestation use case):
+
+- Endpoint Verification deployed to every desktop device that should be
+  evaluated. Two reasons: (1) it's the resolution path Fleet's osquery
+  layer prefers — see *Endpoint Verification as the resolution
+  mechanism* below — and without it Fleet falls back to a less precise
+  email-based lookup; (2) Chrome Enterprise Premium's browser-side
+  attestation signal, which is the specific CBCM/CEP use case
+  fleetdm/fleet#43583 describes, flows through EV. The base
+  CAA-gating-for-Workspace use case works without EV, just with the
+  email-lookup fallback.
 
 **Not required** (common misconceptions worth heading off):
 
@@ -386,13 +412,34 @@ Workspace, this is the default. Fleet must therefore:
   tenants); Fleet never emits ClientStates to a Workspace it isn't
   configured for, and never logs unconfigured emails to telemetry.
 
-**EV not installed is a first-class host state.** If `accounts.json`
-doesn't exist (and the legacy path is also absent), there are no
-deviceUsers to patch and the integration is a no-op for that host. Fleet
-surfaces this as `Endpoint Verification not installed` on the host detail
-page so admins know *why* no signal is going to Google. The customer's CAA
-policy on the Google side already denies access for unenrolled devices, so
-the security posture is correct by default.
+**EV not installed is a degraded mode, not a no-op.** If `accounts.json`
+doesn't exist (and the legacy path is also absent), Fleet falls back to
+the **email-lookup resolution path**: for each Workspace identity Fleet
+knows is signed in on the host (via the IdP host-vitals work in
+fleetdm/fleet#42915, or via any other Fleet-side signal that surfaces
+the user's Workspace email), Fleet calls
+`devices.deviceUsers.lookup?email=user@example.com` and PATCHes against
+whatever deviceUsers Google returns. This works if the user has a
+deviceUser created from some other Google-managed surface (Google
+Mobile Management, Drive for Desktop, certain CAA-gated web sign-ins).
+The integration is *not* a no-op in this mode, but it carries three
+tradeoffs Fleet documents on the host detail page:
+
+- Ambiguity on shared devices: `lookup` returns all deviceUsers tied to
+  the email across *every* device the user has ever signed in on, not
+  just the one Fleet is evaluating. Fleet has to filter by other
+  signals (last-sync recency, platform match) to pick the right one.
+- Dependency on Fleet knowing the user's Workspace email, which means
+  hosts that haven't been resolved via #42915 (or equivalent) can't be
+  evaluated at all.
+- No Chrome Enterprise Premium browser-attestation signal for that
+  host, since CEP routes through EV. The CAA-based gating still works;
+  CEP-specific use cases (the CBCM attestation in #43583) do not.
+
+For both modes Fleet surfaces the resolution path used (`endpoint
+verification` vs `email lookup` vs `no resolution`) on the host detail
+page so admins know *which* signal Fleet is sending to Google for that
+host and why.
 
 ## Behavioral parity with the Microsoft Intune integration
 
@@ -816,9 +863,14 @@ for both providers in this work.
 
 ## Why this is worth doing
 
-- **Closes #43583 in a more general way.** The customer in that issue
-  specifically asked for an MDM-backed trust signal to CEP. CEP consumes
-  Cloud Identity ClientStates. Shipping this integration is the answer.
+- **Covers most of #43583, generalizes the rest.** The customer in that
+  issue asked for an MDM-backed trust signal that CEP can evaluate. The
+  CAA-for-Workspace half of their use case ships directly via
+  ClientState with no Endpoint Verification dependency. The narrower
+  CBCM browser-attestation half (a managed Chrome browser proving it's
+  running on a managed device) additionally requires EV deployed to
+  the device — once that's in place, ClientState carries the signal
+  CEP needs. Either way the architecture is what unblocks the issue.
 - **Closes the open half of #28476.** That issue notes "in the interim, the
   user could write custom policies or use Fleet's host vitals to build an
   automation using Google's Directory API." This proposal makes that the
