@@ -80,6 +80,64 @@ things improve, the third of which is end-user-visible:
 The data model, the fields Fleet writes, and the customer-side
 configuration do not change between non-partner and partner modes.
 
+## Customer-side prerequisites and edition eligibility
+
+Cloud Identity's third-party partner integrations (the feature group that
+includes `devices.deviceUsers.clientStates.patch`) are gated on the
+customer holding one of a specific set of editions. Per Google's
+*Set up third-party partner integrations* admin help page:
+
+> Supported editions for this feature: Frontline Standard and Frontline
+> Plus; Enterprise Standard and Enterprise Plus; Education Standard,
+> Education Plus, and Endpoint Education Upgrade; Cloud Identity
+> Premium.
+
+That is the canonical eligibility list. A customer outside it will see
+`403 PERMISSION_DENIED` on the first ClientState PATCH, regardless of
+how the service account is set up. Fleet's integration page surfaces
+this as "Your Workspace edition does not include Cloud Identity Premium
+security management" rather than a generic auth error.
+
+**Specifically excluded** (Fleet detects and explains):
+
+- Workspace Business Starter, Business Standard, Business Plus.
+- Workspace Enterprise Essentials (without the `+` — Essentials Plus is
+  in scope).
+- Education Fundamentals. Worth calling out because the public Education
+  product page lists "Cloud Identity Premium" as included with
+  Fundamentals — that refers to the Cloud Identity Premium *identity
+  service* (SSO, MFA, basic device management for Education users),
+  which every Education edition gets. The capability this integration
+  depends on is **Cloud Identity Premium security management** (the
+  CAA + partner-integrations feature pack), which only starts at
+  Education Standard. The admin-help editions comparison reflects this;
+  the marketing comparison conflates the two. Treat the admin-help page
+  as authoritative.
+- Cloud Identity Free.
+
+**Required customer-side setup**, beyond having an eligible edition:
+
+- Endpoint Verification deployed to every device that should be evaluated
+  (Chrome extension + native helper on macOS/Windows/Linux). Without EV,
+  there is no `deviceUser` to PATCH — see *Endpoint Verification as the
+  resolution mechanism* below.
+- A super-admin to create the GCP service account, enable domain-wide
+  delegation, and authorize the `https://www.googleapis.com/auth/cloud-identity.devices`
+  scope in the Workspace admin console.
+- The customer's CAA policy authored in admin.google.com referencing the
+  Fleet partner segment (`{C-id}-fleet` for the non-partner path, or the
+  Alliance-assigned partner ID once Fleet ships #28476).
+
+**Not required** (common misconceptions worth heading off):
+
+- Fleet does not need its own Workspace tenant or edition.
+- Fleet does not need to be a registered BeyondCorp Alliance partner —
+  the `{C-id}-fleet` partner segment works on day one. Alliance status
+  is an upgrade (see TL;DR and the partner-status notes below), not a
+  prerequisite.
+- No GCP project of Fleet's needs to exist on the customer side; the
+  service account lives in the customer's project.
+
 ## What the integration does
 
 For each host that is enrolled in Fleet and has at least one Google Workspace
@@ -504,16 +562,14 @@ for both providers in this work.
    treatment; iOS BYOD policy compliance is a question mark since Fleet's
    policy engine is osquery-driven. Out of scope for v1; revisit once the
    desktop integration is shipped.
-3. **Premium-tier gating.** Patch on ClientState requires Cloud Identity
-   Premium / Workspace Enterprise on the customer side, but **not** on
-   Fleet's side. Fleet should detect a `403 PERMISSION_DENIED` with the
-   Premium signal and surface a clear "Workspace Enterprise required"
-   error in the integration page, not a generic auth error.
-4. **Free-tier fallback.** For customers without the Premium SKU, the
-   Directory API's `customerDevices` patch supports a narrower set of
-   compliance signals. Worth supporting as a degraded mode, or scope to
-   Premium for v1?
-5. **Push-vs-pull latency target.** The Entra integration tolerates a
+3. **Lower-tier fallback for non-eligible editions.** Customers outside
+   the eligibility list above (Business Starter/Standard/Plus,
+   Enterprise Essentials non-Plus, Education Fundamentals, Cloud
+   Identity Free) cannot use ClientState. The Directory API's
+   `customerDevices` patch supports a narrower set of compliance signals
+   and may be available to lower tiers. Worth supporting as a degraded
+   mode, or scope to the Premium-only path for v1?
+4. **Push-vs-pull latency target.** The Entra integration tolerates a
    one-hour ceiling. CAA evaluations are real-time and a stale
    `COMPLIANT` signal is a security gap; the default `sync_interval` of
    5 minutes feels right for v1 but the actual target depends on Fleet
