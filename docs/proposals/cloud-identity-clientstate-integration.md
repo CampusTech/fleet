@@ -195,6 +195,22 @@ globally. The shape is identical aside from the key; Fleet's docs ship
 copy-paste-able expression templates with the customer's ID
 auto-substituted on the integration page.
 
+A separate, integration-agnostic boolean is also CAA-evaluable:
+
+```cel
+device.is_admin_approved_device == true
+```
+
+This reflects the deviceUser's approve/block status (driven by
+`devices.deviceUsers.approve` / `:block`, or by an admin clicking
+Approve/Block in admin.google.com). The default Fleet integration does
+**not** write this field — see *v2 opt-in: drive the admin-approved
+boolean via approve/block* below — but customers may already have CAA
+expressions keyed on it from other sources, and the field is included
+here for syntax completeness.
+
+## What the integration does
+
 For each host that is enrolled in Fleet and has at least one Google Workspace
 user signed in on a Cloud-Identity-registered device (i.e., the host has gone
 through Endpoint Verification or Google Mobile Management), Fleet `PATCH`es a
@@ -586,6 +602,150 @@ is). The substantive cases for pursuing Alliance status are admin
 ergonomics (no per-customer customer-ID concatenation in CAA
 expressions) and Google's vetting/listing, not the deny page.
 
+## v2 opt-in: drive the admin-approved boolean via approve/block
+
+Cloud Identity exposes two REST methods adjacent to ClientState:
+
+- `POST {name=devices/*/deviceUsers/*}:approve`
+- `POST {name=devices/*/deviceUsers/*}:block`
+
+Same OAuth scope Fleet already requires (`cloud-identity.devices`),
+same DWD super-admin auth pattern, same
+`devices/{deviceId}/deviceUsers/{deviceUserId}` resource path the
+EV-resolution step already produces. Request body is just
+`{"customer": "customers/my_customer"}`.
+
+These are tempting to frame as "direct enforcement," and that framing
+is wrong. Three independent admin-help pages confirm it:
+
+- *Setting up device approvals:* "Approving or blocking a device
+  doesn't affect the device's ability to access data."
+- *Approve, block, unblock, or delete a managed device* (Endpoint
+  Verification row): "The device can still sync Google data unless a
+  Context-Aware Access policy blocks access."
+- *Require admin approval for device access:* "To limit access to work
+  data on unapproved devices, configure access levels using
+  Context-Aware Access."
+
+So `:approve` / `:block` are **not** an enforcement path that bypasses
+CAA. They write a different signal — a single boolean,
+`device.is_admin_approved_device` — that CAA expressions can key on,
+alongside ClientState's partner-keyed struct
+(`device.vendors["fleet-{C-id}"]`). The boolean is globally contended:
+any super-admin clicking "Approve" or "Block" in admin.google.com, or
+any other automation with the same scope, overrides Fleet immediately.
+There's no partner-scoping the way there is on ClientState.
+
+### Why it's still worth shipping (in v2)
+
+For a customer who wants their CAA expression to be source-agnostic,
+the admin-approved boolean is a cleaner write target than ClientState:
+
+```cel
+// Universal: works regardless of which integration writes the boolean
+device.is_admin_approved_device == true
+
+// vs. Fleet-keyed: customer hard-codes their customer ID into the rule
+device.vendors["fleet-0xxxxxxx"].is_compliant_device == true
+```
+
+If the customer's only device-trust source is Fleet, the boolean rule
+is portable across tenants and survives a future migration to a
+different MDM — whichever MDM also writes the boolean takes over with
+no CAA rewrite. Some customers will prefer this; others (the ones who
+want rich per-policy detail in CAA expressions, or who run multiple
+device-trust sources in parallel) will prefer ClientState. The right
+design is to support both.
+
+### What the integration would do
+
+When `auto_approve_block: true` on a team's integration config:
+
+- ClientState transition to `COMPLIANT` → also call `:approve`.
+- ClientState transition to `NON_COMPLIANT` → also call `:block`.
+- Track the last-known approval state in `host_google_client_state` so
+  the loop doesn't re-issue calls when nothing changed.
+- The activity feed records one entry per state transition; Google's
+  audit log records the responsible service account on its side per
+  *"For details about when the device was blocked and which admin or
+  rule blocked the device, review the device log events."*
+
+### The contention problem and how Fleet handles it
+
+Because the admin-approved boolean is shared across every actor with
+`cloud-identity.devices` scope:
+
+- Fleet does **not** treat its own last-known state as authoritative.
+  Before issuing a state-changing call, the sync loop calls
+  `devices.deviceUsers.get` and reads the current approval state. If
+  the admin or another automation has changed it since Fleet's last
+  call, Fleet logs a "manual override detected on deviceUser X — Fleet
+  is not re-issuing" activity entry and respects the new state until
+  the next ClientState transition.
+- Fleet **never** issues `:approve` against a deviceUser that's
+  currently blocked by a non-Fleet party without explicit operator
+  intervention. That would be Fleet overriding a security action it
+  doesn't have context for.
+- The integration config has a `manual_override_behavior` enum:
+  `respect` (default — Fleet pauses on this deviceUser when overridden,
+  resumes on next ClientState transition) or `reassert` (Fleet
+  re-issues its desired state on next sync). Most customers want
+  `respect`; the `reassert` option exists for customers who want Fleet
+  to be the absolute source of truth.
+
+### Automatic-approval exemptions Fleet docs must call out
+
+Per the *Require admin approval* page:
+
+- *"Company owned devices that are registered by serial number are
+  automatically approved, except Android devices with a work profile."*
+- *"For devices with Google Drive for desktop, if you restrict Drive
+  for desktop to authorized devices, company-owned devices with Drive
+  for desktop are automatically approved."*
+- *"Devices using Drive for desktop without endpoint verification are
+  approved by default."*
+
+So a Fleet-managed mac that's also enrolled via ABM serial-number
+registration in Cloud Identity will already be `approved` before Fleet
+ships its first call. That's fine — Fleet's first `:approve` is a
+no-op — but Fleet docs should explain it so customers don't see "Fleet
+showing as approved before policy evaluation completes" as a bug.
+
+### One Endpoint-Verification-specific side effect to call out
+
+The *Approve, block, unblock, or delete a managed device* page has a
+separate row for Google Drive for desktop: "The user is signed out
+from Drive for desktop and can't sign in to Drive for desktop from
+that device." So while `:block` doesn't immediately deny Workspace
+access broadly, it *does* immediately sign the user out of Drive for
+Desktop. Customers enabling `auto_approve_block` should know this — a
+transient policy failure that flips Fleet's state to non-compliant
+will sign every affected user out of Drive for Desktop, which is a
+real disruption for some workflows and acceptable fail-closed posture
+for others.
+
+### Why v2, not v1
+
+- ClientState alone delivers the core value (rich signal, CAA-evaluable,
+  zero contention) and is enough to close the issues this proposal
+  references (#28476, #43583, #6566).
+- The contention model adds nontrivial complexity to the sync loop
+  (pre-read, respect/reassert config) and needs real-customer feedback
+  before defaults are decided.
+- The Drive for Desktop sign-out side effect is the kind of thing that
+  wants customer beta-testing before becoming an always-available
+  toggle.
+
+v2 also gives time to confirm two empirical questions:
+
+1. Does `:block` on an EV deviceUser persist across the user signing
+   out and back in, or does the next sign-in re-create an approved
+   deviceUser? (Docs are silent.)
+2. Does the deviceUser resource remain queryable via the API after
+   being blocked? (The admin doc says blocked devices "stay in your
+   devices list," implying queryable, but the API-layer behavior isn't
+   confirmed.)
+
 ## Edge cases Fleet decides explicitly here
 
 The Entra guide is silent on these. Fleet should decide and document them
@@ -642,6 +802,17 @@ for both providers in this work.
    `COMPLIANT` signal is a security gap; the default `sync_interval` of
    5 minutes feels right for v1 but the actual target depends on Fleet
    policy-run cadence. Confirm with product.
+5. **v2 approve/block scope.** Two empirical questions blocking the v2
+   design (see *v2 opt-in: drive the admin-approved boolean via
+   approve/block*): does `:block` on an EV deviceUser persist across
+   sign-out / sign-in, and does the deviceUser stay queryable via the
+   API after being blocked? Both are docs-silent. Resolve by writing a
+   test integration before committing to v2 defaults.
+6. **Customer demand for v2 approve/block.** Is the "source-agnostic
+   CAA expression" value proposition (`device.is_admin_approved_device`
+   vs. the customer-ID-concatenated `device.vendors["fleet-{C-id}"]`)
+   real for Fleet customers, or do they all already prefer the richer
+   per-policy detail ClientState gives? Survey before scoping v2.
 
 ## Why this is worth doing
 
@@ -672,3 +843,16 @@ for both providers in this work.
   registered in Cloud Identity (via Endpoint Verification, Google Mobile
   Management, or Chrome Browser Cloud Management); Fleet adds a partner-
   scoped ClientState on top of that registration.
+- `devices.deviceUsers.delete`. The delete method has different
+  semantics from block: per the admin doc, *"The device is removed from
+  the devices list and, in most cases, the device can't sync work data
+  until the user signs in again"*, and for company-owned devices the
+  user is unassigned but the device stays in inventory. That's
+  intentional admin policy, not a compliance-driven action — Fleet does
+  not call it. If the proposal's v2 enforcement work later adds
+  approve/block, it will not extend to delete.
+- v1 also does NOT call `devices.deviceUsers.approve` /
+  `:block`. Those methods are described under *v2 opt-in: drive the
+  admin-approved boolean via approve/block* and require a separate
+  opt-in design pass (contention handling, manual-override behavior,
+  Drive for Desktop sign-out as a side effect) before shipping.
